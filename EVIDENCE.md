@@ -3,7 +3,7 @@
 Everything below was executed on 2026-11-11 from the operator workstation against the live
 constellation. No secrets are recorded here.
 
-## Plexus (the Plexus host, https://plexus.example.ts.net)
+## Plexus (`https://plexus.example.ts.net`)
 
 | Check | Result |
 |---|---|

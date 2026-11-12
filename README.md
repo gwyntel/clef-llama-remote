@@ -10,7 +10,7 @@ the always-on `neuralwatt` and `openrouter` rungs, and disappears when the VM di
 ```
 Colab VM (ephemeral)                                    constellation
 ┌──────────────────────────────────────────────┐        ┌───────────────────────────┐
-│ llama-server  :8091  CUDA_VISIBLE_DEVICES=0  │        │ Plexus (the Plexus host)           │
+│ llama-server  :8091  CUDA_VISIBLE_DEVICES=0  │        │ Plexus gateway             │
 │ llama-server  :8092  CUDA_VISIBLE_DEVICES=1  │◀──┐    │  alias cloudflare/clef-   │
 │        ▲            ▲                        │   │    │        flash              │
 │        └─ round-robin proxy 127.0.0.1:8080 ──┼───┘    │   LOCAL  ──▶ clef-llama-  │
@@ -30,11 +30,10 @@ Colab VM (ephemeral)                                    constellation
 | `notebooks/clef-llama-colab-v5.ipynb` | the runtime: 19 cells, 13 code cells, 3 labelled shell cells |
 | `plexus_setup.py` | one-time: creates the provider + the **disabled** rung, pins the alias context |
 | `README.md` | this file |
-| `aliases.snapshot.json` / `aliases.before-20261111.json` | alias snapshots taken before the one-time setup |
-| `clef_remote_key.txt` | the bearer the provider sends and every worker requires (local only, never committed) |
+| `EVIDENCE.md` | verified-facts log: management calls, rung context sources, and the end-to-end routing proof |
 | `tools/rung.py` | `status` / `on --base …` / `off` / `base --base …` — flip the rung by hand, each write re-`GET`-ed |
 | `tools/standin_systemone.py` | stand-in `/v1/systemone` upstream (marked answers, no model) used to prove routing end to end |
-| `EVIDENCE.md` | the verified-facts log: management calls, rung context sources, the the Plexus host routing proof |
+| `clef_remote_key.txt` | local-only bearer for the provider; gitignored, never committed |
 
 ## What the run does, in order
 
@@ -66,14 +65,18 @@ Colab VM (ephemeral)                                    constellation
     `maxConcurrency` → the live worker count (1 or 2), then `timeoutMs` **read live** and raised to
     600000 if the provider still carries less than 300000 (and re-`GET`-ed; a write that does not
     stick aborts bring-up), then the rung's `enabled` flag flipped in the alias's `LOCAL` group.
-11. **Self-test** (optional, needs `PLEXUS_API_KEY`) — one choice + one noul question through
+11. **Self-test** (requires `PLEXUS_API_KEY`) — one choice + one noul question through
     `https://plexus.example.ts.net/v1/systemone`; the proxy's served counter proves the call
-    landed here. Any request/answer/routing failure triggers teardown, which disables the rung first.
-    Without `PLEXUS_API_KEY`, this inference-level proof is skipped; worker readiness is still checked.
+    landed here. The checker requires a `choice` answer with a real criterion and a numeric
+    `noul` in `[0,1]`. Any request/answer/routing failure triggers teardown, which disables the
+    rung first.
 
 Teardown reverses the dependency order: **rung disabled first** (verified), then the provider's
 `maxConcurrency` restored to its configured baseline (2), then workers (SIGTERM → SIGKILL after
-15 s), then proxy, then `tailscale serve reset` + `tailscale down`.
+15 s), then proxy, then `tailscale serve reset` + `tailscale down`. If the rung cannot be verified
+disabled after three attempts, v5 stops before killing the workers and reports
+`teardown : INCOMPLETE`; the explicit `stop(force=True)` path is required to destroy a still-routed
+node.
 `atexit` plus SIGINT/SIGTERM/SIGHUP handlers, so a stopped cell or a dead kernel still cleans up
 — but only while the kernel exists. A second caller (atexit, a signal, or the shutdown cell) waits
 for the teardown already in flight instead of returning while sockets are still closing, and worker
@@ -225,7 +228,7 @@ curl -s https://plexus.example.ts.net/v1/systemone \
 
 ## Operational notes
 
-- **Provider base URL is rewritten every run.** the Plexus host has CorpDNS/MagicDNS off and cannot resolve
+- **Provider base URL is rewritten every run.** The Plexus host has CorpDNS/MagicDNS off and cannot resolve
   `*.ts.net`, so the notebook writes its own `100.x` IPv4 into `api_base_url.systemone`. Never pin a
   `*.ts.net` name there.
 - **Hostname drift is survivable.** If the join lands on `clef-llama-remote-1...` (stale ephemeral
