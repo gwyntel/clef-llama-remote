@@ -1,0 +1,17 @@
+# Local credentials and generated state
+clef_remote_key.txt
+clef-llama-colab-secrets.json
+*.secrets.json
+.env
+.env.*
+aliases.snapshot.json
+aliases.before-*.json
+*.log
+logs/
+state/
+
+# Python and editor noise
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
