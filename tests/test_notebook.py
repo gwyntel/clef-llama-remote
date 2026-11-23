@@ -300,6 +300,16 @@ class RegistryUrl(unittest.TestCase):
                     "http://100.64.7.7:8769#frag"):
             self.assertFalse(self.ok(bad), bad)
 
+    def test_registry_url_can_come_from_the_colab_secret_panel(self):
+        """In Colab the natural place for a value is the secret panel, not the shell.
+
+        _secret() checks userdata first and falls back to the environment, so using it here is
+        what makes CLEF_REGISTRY_URL settable the same way as the two credentials.
+        """
+        src = "".join(load(V10)["cells"][3]["source"])
+        self.assertIn('_secret("CLEF_REGISTRY_URL", required=False)', src)
+        self.assertNotIn('REGISTRY_URL = os.environ.get("CLEF_REGISTRY_URL", "")', src)
+
     def test_config_cell_refuses_to_start_with_a_bad_url(self):
         src = "".join(load(V10)["cells"][3]["source"])
         self.assertIn("if not _registry_url_ok(REGISTRY_URL):", src)

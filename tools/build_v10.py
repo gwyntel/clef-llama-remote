@@ -448,7 +448,9 @@ def _registry_url_ok(value: str) -> bool:
         return False
 
 
-REGISTRY_URL = os.environ.get("CLEF_REGISTRY_URL", "").rstrip("/")
+# Read through _secret() so the Colab secret panel, a Kaggle dataset and the environment all
+# work: a value that can only be set in one of them is a trap at the first cell.
+REGISTRY_URL = _secret("CLEF_REGISTRY_URL", required=False).rstrip("/")
 if not REGISTRY_URL:
     raise SystemExit(
         "set CLEF_REGISTRY_URL to the registrar's tailnet URL, for example "
