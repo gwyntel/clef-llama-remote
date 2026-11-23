@@ -297,7 +297,39 @@ with **403**.
    propagation, with a bounded budget (8 cheap attempts, 3 s apart) while transport failures stay
    capped at 3 so a hung request cannot exceed the client's 650 s ready timeout.
 
-## Parent linking — not yet done, and why
+## Parent linking — DONE (2026-11-23)
+
+Applied in the quiescent window (judge cron paused, both alias-writing timers stopped, no live
+v9 runtime — the only `clef-llama-remote` node was `offline, last seen 43m ago`).
+
+Method, per parent: snapshot -> append one `{"alias": "clef-flash-notebooks", "enabled": true}`
+to the existing `LOCAL` group -> `PUT` the full object minus read-only `slug` -> fresh `GET`.
+
+| Parent | Result |
+|---|---|
+| `clef-flash-local` | pointer present exactly once, enabled; removing it restores the pre-write snapshot |
+| `cloudflare/clef-flash` | pointer present exactly once, enabled; removing it restores the pre-write snapshot |
+
+Both verified by: strip the inserted pointer from the fresh read, normalize read-only `slug` and
+pointer read/write naming, then compare with the pre-write snapshot. Group order, selectors,
+`sticky_session`, `additional_aliases` (`clef-flash`, `talkie-judge`), SUB/FALLBACK groups and
+every legacy target are unchanged. Snapshots: `parent-snapshots/20261123T0802*-*.json`.
+
+Final LOCAL groups: `clef-llama-remote` (on, dead — see below), `clef-flash-mac` (off),
+`clef-flash-notebooks` (on).
+
+**Integrated route proven after linking**: `POST /v1/systemone` with `model=clef-flash-local`
+returned HTTP 200 in 0.5 s, `usage.input_tokens=223`, and the response's `model` field was
+`/kaggle/temp/clef/models/.../Cloudflare_clef-flash-Q4_K_M.gguf` — i.e. the request fell through
+the dead legacy rung and was served by the notebook through the pool.
+
+**Pre-existing drift, not caused by v10:** the legacy provider `clef-llama-remote` was repointed
+by a v9 run to `http://100.124.240.60:8443/v1` with `maxConcurrency: 1` (it was
+`100.101.46.86:8443`, 2, at planning time), and that node is now offline. The LOCAL rung is still
+`enabled`, so each `clef-flash-local` request pays one failed attempt before failing over. v10
+never wrote that provider; repairing it is a separate routing decision.
+
+## Parent linking — original procedure (kept for reference)
 
 `clef-flash-notebooks` does not exist until the first notebook is admitted (the registrar only
 writes the pool once it has a published lease; it will not create an empty alias, because that
