@@ -7,6 +7,7 @@ import ast
 import json
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -189,10 +190,50 @@ class Generated(unittest.TestCase):
         watch = ast.unparse(names["_watch"])
         self.assertNotIn("rung_enabled", watch)
         self.assertIn("lease", watch)
-        # start() must take the VM-wide lock before spawning workers.
-        start = ast.unparse(names["start"])
-        self.assertIn("flock", start)
-        self.assertIn("LOCK_NB", start)
+        # start() must take the VM-wide lock before spawning workers, and the lock helper
+        # must be the thing that actually flocks (a no-op helper would satisfy a substring).
+        start = names["start"]
+        lock_call = [n.lineno for n in ast.walk(start)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                     and n.func.id == "_acquire_vm_lock"]
+        worker_ref = [n.lineno for n in ast.walk(start)
+                      if isinstance(n, ast.Attribute) and n.attr == "_start_workers"]
+        self.assertTrue(lock_call, "start() must call _acquire_vm_lock")
+        self.assertTrue(worker_ref, "start() must reference _start_workers")
+        self.assertLess(min(lock_call), min(worker_ref),
+                        "the VM-wide lock must be taken before any worker is started")
+
+        # Teardown ordering, by AST position: withdraw -> drain -> workers -> own device -> down.
+        stop = names["stop"]
+
+        def at(predicate):
+            lines = [n.lineno for n in ast.walk(stop) if predicate(n)]
+            return min(lines) if lines else None
+
+        def call(attr, name=None):
+            def predicate(node):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    return False
+                if node.func.attr != attr:
+                    return False
+                if name is not None:
+                    return isinstance(node.func.value, ast.Name) and node.func.value.id == name
+                return True
+            return predicate
+
+        order = [
+            ("withdraw", at(call("withdraw"))),
+            ("drain", at(lambda n: isinstance(n, ast.Attribute) and n.attr == "active")),
+            ("workers", at(call("stop", "worker"))),
+            ("own device", at(call("own_device_id"))),
+            ("tailnet down", at(call("down"))),
+        ]
+        for label, line in order:
+            self.assertIsNotNone(line, f"stop() never {label}")
+        self.assertEqual([line for _, line in order],
+                         sorted(line for _, line in order),
+                         "stop() must withdraw, drain, stop workers, delete its own device, "
+                         "then leave the tailnet")
 
     def test_proxy_tracks_active_and_reports_run_id(self):
         trees = [parseable(src) for _, src in code_cells(self.nb)]
@@ -222,8 +263,6 @@ class Generated(unittest.TestCase):
             self.assertIsNone(re.search(pattern, src), f"literal secret shape {pattern} present")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RegistryUrl(unittest.TestCase):
@@ -250,15 +289,15 @@ class RegistryUrl(unittest.TestCase):
         cls.ok = staticmethod(namespace["_registry_url_ok"])
 
     def test_accepts_literal_tailnet_ipv4_with_port(self):
-        self.assertTrue(self.ok("http://100.121.214.107:8769"))
+        self.assertTrue(self.ok("http://100.64.7.7:8769"))
         self.assertTrue(self.ok("http://100.64.0.1:8769/"))
 
     def test_rejects_shapes_that_could_capture_the_lease_token(self):
-        for bad in ("", "http://100.121.214.107", "https://100.121.214.107:8769",
+        for bad in ("", "http://100.64.7.7", "https://100.64.7.7:8769",
                     "http://plexus.example.invalid:8769", "http://8.8.8.8:8769",
-                    "http://192.168.86.5:8769", "http://user:pw@100.121.214.107:8769",
-                    "http://100.121.214.107:8769/v1", "http://100.121.214.107:8769?x=1",
-                    "http://100.121.214.107:8769#frag"):
+                    "http://192.0.2.5:8769", "http://user:pw@100.64.7.7:8769",
+                    "http://100.64.7.7:8769/v1", "http://100.64.7.7:8769?x=1",
+                    "http://100.64.7.7:8769#frag"):
             self.assertFalse(self.ok(bad), bad)
 
     def test_config_cell_refuses_to_start_with_a_bad_url(self):
@@ -290,3 +329,310 @@ class NoHouseholdDetails(unittest.TestCase):
         src = "\n".join("".join(c["source"]) for c in nb["cells"])
         self.assertTrue("PLEXUS_BASE = (os.environ.get" not in src,
                         "no gateway endpoint default may be baked in")
+
+
+def _method_tree(nb, class_name, method_name):
+    """The AST node for one method of one class in the generated notebook."""
+    for _, src in code_cells(nb):
+        tree = parseable(src)
+        if tree is None:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == method_name:
+                        return item
+    raise AssertionError(f"{class_name}.{method_name} not found")
+
+
+def _exec_function(nb, cell_index, name, extra=None):
+    """Compile one module-level function out of a cell and return it.
+
+    Only the requested definition runs, so a cell's secrets, filesystem probes and GPU calls
+    never execute in a test.
+    """
+    tree = ast.parse("".join(nb["cells"][cell_index]["source"]))
+    found = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
+    if len(found) != 1:
+        raise AssertionError(f"expected exactly one {name} in cell {cell_index}")
+    namespace = dict(extra or {})
+    exec(compile(ast.Module(body=[found[0]], type_ignores=[]), f"<{name}>", "exec"), namespace)
+    return namespace[name]
+
+
+class Behaviour(unittest.TestCase):
+    """Drive the generated notebook's own code, not a description of it.
+
+    Everything here is offline: no Tailscale call, no socket, no secret.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.nb = load(V10)
+
+    # ---------------------------------------------------------------- VM-wide lock
+    def test_a_second_kernel_on_the_same_vm_is_refused(self):
+        import fcntl as _fcntl
+        import pathlib
+
+        acquire = _exec_function(self.nb, 11, "_acquire_vm_lock",
+                                 {"fcntl": _fcntl, "Path": pathlib.Path})
+        with tempfile.TemporaryDirectory() as tmp:
+            first = acquire(tmp)
+            try:
+                with self.assertRaises(RuntimeError) as caught:
+                    acquire(tmp)
+                self.assertIn("another kernel on this VM", str(caught.exception))
+            finally:
+                first.close()
+            # Releasing must make it available again, or a restart could never take the lock.
+            second = acquire(tmp)
+            second.close()
+
+    # ------------------------------------------------------- exact-owner cleanup
+    def _tailscale(self):
+        import datetime
+        import json as _json
+        import os as _os
+        import pathlib
+        import re as _re
+        import signal as _signal
+        import socket as _socket
+        import subprocess as _subprocess
+        import time as _time
+        import urllib.error as _uerr
+        import urllib.request as _ureq
+
+        namespace = {
+            "TS_DIR": pathlib.Path("/nonexistent-ts"), "TS_SOCK": pathlib.Path("/nonexistent.sock"),
+            "TS_STATE": pathlib.Path("/nonexistent.state"), "TS_HOSTNAME": "clef-nb-" + "a" * 32,
+            "SECRETS": {"TAILSCALE_API_KEY": "test-key"}, "PROBE_TIMEOUT": 1.0,
+            "TS_API_BASE": "https://api.tailscale.com/api/v2", "TS_TAG": "tag:endpoints",
+            "TS_AUTHKEY_EXPIRY_SECONDS": 3600, "Path": pathlib.Path, "re": _re, "json": _json,
+            "os": _os, "time": _time, "socket": _socket, "signal": _signal,
+            "subprocess": _subprocess, "urllib": _ureq, "datetime": datetime,
+            "log": lambda message: None,
+        }
+        tree = ast.parse("".join(self.nb["cells"][10]["source"]))
+        klass = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Tailscale"]
+        self.assertEqual(len(klass), 1)
+        exec(compile(ast.Module(body=[klass[0]], type_ignores=[]), "<Tailscale>", "exec"), namespace)
+        return namespace["Tailscale"]()
+
+    def test_only_the_recorded_own_device_may_be_deleted(self):
+        ts = self._tailscale()
+        ours = {"id": "d-own", "nodeId": "node-1", "addresses": ["100.64.7.7"],
+                "hostname": "clef-nb-" + "a" * 32}
+        # Same hostname prefix, different node: on a shared hostname this is exactly the
+        # device a prefix sweep would have deleted.
+        other = {"id": "d-other", "nodeId": "node-2", "addresses": ["100.64.8.8"],
+                 "hostname": "clef-nb-" + "b" * 32}
+        devices = [ours, other]
+        deleted = []
+        ts.status = lambda: {"Self": {"ID": "node-1", "TailscaleIPs": ["100.64.7.7"]}}
+        ts.devices = lambda: list(devices)
+
+        def api(method, path, payload=None, timeout=45.0, allowed=(200,)):
+            self.assertEqual(method, "DELETE")
+            deleted.append(path)
+            devices.remove(ours)
+            return 200, {}
+
+        ts._api = api
+        with self.assertRaises(RuntimeError) as caught:
+            ts.delete_device("d-other")
+        self.assertIn("refusing to delete", str(caught.exception))
+        self.assertEqual(deleted, [], "no foreign device may be deleted")
+
+        self.assertTrue(ts.delete_device("d-own"))
+        self.assertEqual(deleted, ["/device/d-own"])
+
+    def test_deletion_must_be_confirmed(self):
+        ts = self._tailscale()
+        ours = {"id": "d-own", "nodeId": "node-1", "addresses": ["100.64.7.7"], "hostname": "x"}
+        ts.status = lambda: {"Self": {"ID": "node-1", "TailscaleIPs": ["100.64.7.7"]}}
+        ts.devices = lambda: [ours]          # the API keeps listing it after the DELETE
+        ts._api = lambda *a, **k: (200, {})
+        with self.assertRaises(RuntimeError) as caught:
+            ts.delete_device("d-own")
+        self.assertIn("deletion not confirmed", str(caught.exception))
+
+    def test_no_device_id_is_a_no_op(self):
+        self.assertFalse(self._tailscale().delete_device(None))
+
+    # --------------------------------------------------- rerun refuses a live runtime
+    def _guard(self):
+        """Compile the config cell's live-runtime guard on its own."""
+        tree = ast.parse("".join(self.nb["cells"][3]["source"]))
+        nodes = []
+        for index, node in enumerate(tree.body):
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "_prior_runtime" for t in node.targets):
+                nodes = [node, tree.body[index + 1]]
+                break
+        if len(nodes) != 2:
+            raise AssertionError("live-runtime guard not found in the config cell")
+        return compile(ast.Module(body=nodes, type_ignores=[]), "<guard>", "exec")
+
+    def test_reconfiguring_under_a_live_runtime_is_refused(self):
+        guard = self._guard()
+
+        class Live:
+            _stopped = False
+
+        with self.assertRaises(RuntimeError) as caught:
+            exec(guard, {"RUNTIME": Live()})
+        self.assertIn("live Runtime already exists", str(caught.exception))
+
+        class Stopped:
+            _stopped = True
+
+        exec(guard, {"RUNTIME": Stopped()})     # a stopped runtime may be replaced
+        exec(guard, {})                          # first run in a fresh kernel
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class Teardown(unittest.TestCase):
+    """Drive the generated Runtime.stop() itself against fakes.
+
+    This is the part Appendix F warns cannot be proven by ast.parse: ordering, the drain
+    deadline, and what teardown is allowed to release while resources are still running.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.nb = load(V10)
+
+    def _build(self):
+        import fcntl as _fcntl
+        import threading
+        import types
+
+        node = _method_tree(self.nb, "Runtime", "stop")
+        module = ast.Module(
+            body=[ast.ClassDef(name="Fake", bases=[], keywords=[], body=[node],
+                               decorator_list=[], type_params=[])],
+            type_ignores=[])
+        ast.fix_missing_locations(module)
+        # A clock that advances only when slept on: the drain loop then reaches its 600 s
+        # deadline in a few hundred iterations instead of spinning or waiting for real.
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        clock = types.SimpleNamespace(sleep=sleep, time=lambda: now[0])
+        namespace = {"fcntl": _fcntl, "time": clock, "log": lambda message: None,
+                     "RUN_ID": "a" * 32}
+        exec(compile(module, "<stop>", "exec"), namespace)
+        return namespace["Fake"](), threading
+
+    class _Lease:
+        def __init__(self, phase="withdrawn"):
+            self.phase = phase
+
+        def withdraw(self):
+            if self.phase != "withdrawn":
+                raise RuntimeError("withdrawal unconfirmed")
+            return {"phase": "withdrawn"}
+
+    class _Proxy:
+        def __init__(self, active=0):
+            self.active = active
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    class _Worker:
+        slot = 0
+
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    class _Ts:
+        def __init__(self):
+            self.deleted = []
+            self.down_called = False
+
+        def own_device_id(self):
+            return "d-own"
+
+        def delete_device(self, device_id):
+            self.deleted.append(device_id)
+            return True
+
+        def serve_reset(self):
+            pass
+
+        def down(self):
+            self.down_called = True
+
+        def stop_daemon(self):
+            pass
+
+    def test_drain_deadline_leaves_resources_and_the_vm_lock_alone(self):
+        runtime, threading = self._build()
+        runtime._guard = threading.Lock()
+        runtime._stopped = False
+        runtime._done = threading.Event()
+        runtime._stop = threading.Event()
+        runtime.lease = self._Lease()
+        runtime.proxy = self._Proxy(active=1)     # never drains
+        worker = self._Worker()
+        runtime.workers = [worker]
+        runtime.ts = self._Ts()
+        with tempfile.NamedTemporaryFile() as lock_handle:
+            runtime._vm_lock = open(lock_handle.name, "a+")
+            runtime.stop(reason="test")
+            self.assertFalse(worker.stopped, "workers must survive an incomplete drain")
+            self.assertFalse(runtime.proxy.stopped, "the proxy must survive too")
+            self.assertFalse(runtime._vm_lock.closed,
+                             "a kernel still holding GPUs must keep the VM lock")
+            self.assertFalse(runtime._stopped, "a retryable stop must not look finished")
+
+    def test_confirmed_withdrawal_and_empty_drain_stops_everything_in_order(self):
+        runtime, threading = self._build()
+        runtime._guard = threading.Lock()
+        runtime._stopped = False
+        runtime._done = threading.Event()
+        runtime._stop = threading.Event()
+        runtime.lease = self._Lease()
+        runtime.proxy = self._Proxy(active=0)
+        worker = self._Worker()
+        runtime.workers = [worker]
+        ts = self._Ts()
+        runtime.ts = ts
+        with tempfile.NamedTemporaryFile() as lock_handle:
+            runtime._vm_lock = open(lock_handle.name, "a+")
+            handle = runtime._vm_lock
+            runtime.stop(reason="test")
+            self.assertTrue(worker.stopped)
+            self.assertTrue(runtime.proxy.stopped)
+            self.assertEqual(ts.deleted, ["d-own"], "only its own device may be deleted")
+            self.assertTrue(ts.down_called)
+            self.assertTrue(handle.closed, "the VM lock is released once resources are gone")
+
+    def test_unconfirmed_withdrawal_keeps_everything_running(self):
+        runtime, threading = self._build()
+        runtime._guard = threading.Lock()
+        runtime._stopped = False
+        runtime._done = threading.Event()
+        runtime._stop = threading.Event()
+        runtime.lease = self._Lease(phase="active")   # withdrawal will keep failing
+        runtime.proxy = self._Proxy(active=0)
+        worker = self._Worker()
+        runtime.workers = [worker]
+        runtime.ts = self._Ts()
+        with tempfile.NamedTemporaryFile() as lock_handle:
+            runtime._vm_lock = open(lock_handle.name, "a+")
+            runtime.stop(reason="test")
+            self.assertFalse(worker.stopped, "an unconfirmed withdrawal must not stop serving")
+            self.assertFalse(runtime._stopped)
+            self.assertFalse(runtime._vm_lock.closed)

@@ -20,6 +20,15 @@ Restart=on-failure
 RestartSec=10
 UMask=0077
 NoNewPrivileges=true
+# Defence in depth for a process that holds the Plexus admin key. Deliberately conservative:
+# the registrar only needs TCP/IP, a unix socket for nothing, its state directory and DNS.
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+TasksMax=64
+# Optional, once a first start has been verified: ProtectSystem=strict with
+# ReadWritePaths=/home/hermes/.hermes/state, and ProtectHome=read-only. Left off here so a
+# first activation cannot fail on a path this unit did not anticipate.
 
 [Install]
 WantedBy=default.target

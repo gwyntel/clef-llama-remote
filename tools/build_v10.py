@@ -692,6 +692,32 @@ def transform_cell10(src: str) -> str:
     return src
 
 
+
+VM_LOCK_HELPER = '''
+def _acquire_vm_lock(root):
+    """Take this VM's runtime lock, or refuse to start.
+
+    One runtime per VM: a second kernel would contend for the GPUs, for ports 8091/8092 and
+    for tailscaled's single userspace proxy port. Separate VMs stay independent, because the
+    lock file lives beside the runtime files rather than in a global location.
+    """
+    path = Path(root) / "clef-runtime.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise RuntimeError(
+            f"another kernel on this VM holds {path}: refusing to share the GPUs, the worker "
+            "ports or the userspace tailscale proxy. Stop that runtime first; separate "
+            "Colab/Kaggle runtimes are independent and supported."
+        ) from None
+    return handle
+
+
+class SelfTestFailure(RuntimeError):
+'''
 # --------------------------------------------------------------------------- cell 11
 INIT_V10 = '''
 def __init__(self, client: PlexusClient | None = None, ts: Tailscale | None = None) -> None:
@@ -727,21 +753,8 @@ def start(self) -> "Runtime":
             raise RuntimeError("Runtime.start() was already called in this kernel")
         if self._vm_lock is not None:
             raise RuntimeError("bring-up already started in this kernel")
-    # One runtime per VM. A second kernel would contend for the GPUs, for the loopback worker
-    # ports and for tailscaled's single userspace proxy port, so it is refused before anything
-    # is spawned. Separate VMs remain fully independent.
-    lock_path = ROOT / "clef-runtime.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_handle = open(lock_path, "a+")
-    try:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        lock_handle.close()
-        raise RuntimeError(
-            f"another kernel on this VM holds {lock_path}: refusing to share the GPUs, the "
-            "worker ports or the userspace tailscale proxy. Stop that runtime first; separate "
-            "Colab/Kaggle runtimes are independent and supported."
-        ) from None
+    # One runtime per VM, taken before anything is spawned (see _acquire_vm_lock).
+    lock_handle = _acquire_vm_lock(ROOT)
     with self._guard:
         if self._stopped:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
@@ -774,13 +787,13 @@ def start(self) -> "Runtime":
                 self._ensure_running()
                 stage()
         # Admission is the ONLY enable operation: the registrar creates this run's provider,
-        # proves it through Plexus and enables that single pool target. It is serialized with
-        # stop() so a teardown that won the guard can never be reversed by a late admission.
+        # proves it through Plexus and enables that single pool target. Deliberately NOT under
+        # _guard: a readiness probe can take minutes, and holding the lock across it would stop
+        # a stop() from even being recorded. A stop that withdrew first makes this admission
+        # fail (the registrar returns 410 for a terminal lease) rather than publish.
         self._ensure_running()
         self._mark("admission")
-        with self._guard:
-            self._ensure_running()
-            self._self_test()
+        self._self_test()
         self._ensure_running()
     except BaseException:
         log("bring-up     : failed — tearing down (lease withdrawn first)")
@@ -944,11 +957,17 @@ def _watch(self) -> None:
 STOP_V10 = '''
 def stop(self, reason: str = "", force: bool = False) -> None:
     with self._guard:
-        if self._stopped:
-            self._await_teardown()
-            return
-        self._stopped = True
-        self._done.clear()
+        waiting = self._stopped
+        if not waiting:
+            self._stopped = True
+            self._done.clear()
+    if waiting:
+        # Wait OUTSIDE the lock: an INCOMPLETE teardown re-takes it to reset _stopped, so
+        # waiting while holding it would deadlock until the 300 s timeout and then report a
+        # completion that never happened.
+        self._await_teardown()
+        return
+    keep_vm_lock = False
     log(f"teardown     : start{' — ' + reason if reason else ''}")
     leasing = self.lease is not None
     withdrawn = not leasing
@@ -1003,6 +1022,8 @@ def stop(self, reason: str = "", force: bool = False) -> None:
                     "after the 600 s drain deadline; workers are being left running"
                 )
                 if not force:
+                    # Workers are still running, so this kernel still owns the VM lock.
+                    keep_vm_lock = True
                     with self._guard:
                         self._stopped = False
                     self._done.set()
@@ -1053,7 +1074,7 @@ def stop(self, reason: str = "", force: bool = False) -> None:
             except Exception as exc:
                 log(f"tailscale    : daemon stop failed ({exc})")
     finally:
-        if self._vm_lock is not None:
+        if self._vm_lock is not None and not keep_vm_lock:
             try:
                 fcntl.flock(self._vm_lock.fileno(), fcntl.LOCK_UN)
                 self._vm_lock.close()
@@ -1066,6 +1087,30 @@ def stop(self, reason: str = "", force: bool = False) -> None:
 
 
 def transform_cell11(src: str) -> str:
+    # The VM-wide lock becomes a named helper so its refusal is testable without a GPU.
+    src = sub(src, "class SelfTestFailure(RuntimeError):", VM_LOCK_HELPER.strip("\n") + "\n")
+    # v9's Runtime docstring described the opposite lifecycle (disable a rung, restore a
+    # shared concurrency); leaving it would mislead every reader of the deliverable.
+    src = sub(
+        src,
+        '''    """Owns the whole ephemeral node: workers, proxy, tailnet, Plexus registration.
+
+    Bring-up:  workers -> GPU residency proof -> tailscale -> proxy -> tailnet reachability
+               -> provider base URL/concurrency/timeout -> rung enabled.
+    Teardown:  rung disabled FIRST (so Plexus stops routing), then the configured concurrency,
+               then workers, then the proxy, then the tailnet.
+    """''',
+        '''    """Owns the whole ephemeral node: workers, proxy, tailnet, and this run's lease.
+
+    Bring-up:  workers -> GPU residency proof -> tailscale -> proxy -> tailnet reachability
+               -> registrar reachability -> lease -> admission. The registrar creates this
+               run's provider and enables it in the pool; nothing here writes a provider or
+               an alias.
+    Teardown:  lease withdrawn and verified FIRST (so the pool stops selecting this node),
+               then a routing-reload wait and a local drain, then workers, then the proxy,
+               then this run's own tailnet device.
+    """''',
+    )
     src = replace_method(src, "Runtime", "__init__", INIT_V10)
     src = replace_method(src, "Runtime", "start", START_V10)
     src = replace_method(src, "Runtime", "_start_tailnet", START_TAILNET_V10)
@@ -1142,13 +1187,124 @@ except Exception as exc:
 
 
 # --------------------------------------------------------------------------- build
+FORBIDDEN_DEFS = {
+    # method/function names that only exist to write shared routing state, or to skip admission
+    "cleanup_duplicate_nodes", "_is_notebook_device", "_restore_concurrency",
+    "_provider_api_key", "set_rung_enabled", "rung_enabled", "put_alias", "get_alias",
+    "put_provider", "get_provider", "set_provider_base", "set_provider_concurrency",
+    "set_provider_timeout_ms", "_req",
+}
+FORBIDDEN_TEXT = (
+    # a credential the notebook must not hold, or a switch that could admit it unverified
+    "CLEF_SKIP_SELF_TEST", "x-admin-key", "PLEXUS_ADMIN_KEY", "PLEXUS_API_KEY",
+)
+STOP_ORDER = ("withdraw", "active", "stop", "own_device_id", "down")
+
+
+def assert_complete(cells) -> None:
+    """Refuse to emit a notebook that can still touch shared routing state.
+
+    Appendix F's completeness gate: an AST inventory, not a string search. A regenerated
+    baseline or a mistyped transform must fail the BUILD, not merely a later test run --
+    otherwise `--check` happily certifies a notebook that writes a parent alias.
+    """
+    defined, called = set(), set()
+    for index, cell in enumerate(cells):
+        if cell["cell_type"] != "code":
+            continue
+        text = "".join(cell["source"])
+        if text.lstrip().startswith("%%"):
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as exc:
+            raise RuntimeError(f"cell {index} does not compile: {exc}") from None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defined.add(node.name)
+            if isinstance(node, ast.Attribute):
+                called.add(node.attr)
+                if isinstance(node.value, ast.Attribute):
+                    called.add(node.value.attr)
+        for needle in FORBIDDEN_TEXT:
+            if needle in text:
+                raise RuntimeError(f"cell {index} contains forbidden text {needle!r}")
+
+    bad = sorted((defined | called) & FORBIDDEN_DEFS)
+    if bad:
+        raise RuntimeError("shared-writer symbols survived the transform: " + ", ".join(bad))
+
+    # The one enable path is the registrar's admission, and teardown must withdraw before it
+    # drains and before it frees resources.
+    runtime = None
+    for cell in cells:
+        if cell["cell_type"] != "code":
+            continue
+        try:
+            tree = ast.parse("".join(cell["source"]))
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "Runtime":
+                runtime = node
+    if runtime is None:
+        raise RuntimeError("Runtime class not found in the generated notebook")
+    methods = {n.name: n for n in runtime.body
+               if isinstance(n, ast.FunctionDef)}
+    missing = [name for name in ("start", "stop", "_self_test", "_watch")
+               if name not in methods]
+    if missing:
+        raise RuntimeError("Runtime is missing lifecycle methods: " + ", ".join(missing))
+    selftest = ast.unparse(methods["_self_test"])
+    if "lease.ready()" not in selftest:
+        raise RuntimeError("_self_test must be the registrar's admission")
+    # Ordering is checked on AST node positions, not on substrings: "self._stop.set()" is not
+    # "stop()", and a substring search would happily accept a teardown that deletes the node
+    # before it kills the workers.
+    def first_line(tree, predicate):
+        lines = [n.lineno for n in ast.walk(tree) if predicate(n)]
+        return min(lines) if lines else None
+
+    def _call(attr, value_name=None, also=()):
+        def predicate(node):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                return False
+            if node.func.attr not in (attr,) + tuple(also):
+                return False
+            if value_name is not None:
+                return isinstance(node.func.value, ast.Name) and node.func.value.id == value_name
+            return True
+        return predicate
+
+    steps = [
+        ("withdraw the lease", _call("withdraw")),
+        ("drain in-flight requests", lambda n: isinstance(n, ast.Attribute) and n.attr == "active"),
+        ("stop the workers", _call("stop", value_name="worker")),
+        ("delete this run's own node", _call("own_device_id", also=("delete_device",))),
+        ("leave the tailnet", _call("down")),
+    ]
+    stop_tree = methods["stop"]
+    positions = []
+    for label, predicate in steps:
+        line = first_line(stop_tree, predicate)
+        if line is None:
+            raise RuntimeError(f"stop() never {label}")
+        positions.append((line, label))
+    if [line for line, _ in positions] != sorted(line for line, _ in positions):
+        raise RuntimeError("stop() must run in this order: "
+                           + ", ".join(label for _, label in sorted(positions)))
+
+    # start() must take the VM-wide lock before it can spawn anything.
+    start_tree = methods["start"]
+    lock_line = first_line(start_tree, _call("flock"))
+    worker_line = first_line(start_tree, lambda n: isinstance(n, ast.Attribute) and n.attr == "_start_workers")
+    if lock_line is None or worker_line is None or lock_line > worker_line:
+        raise RuntimeError("start() must take the VM-wide lock before it starts workers")
+
+
 def build() -> str:
     nb = json.loads(V9_PATH.read_text())
     lease_source = LEASE_PATH.read_text()
-
-    sources = {"".join(c["source"]) for c in nb["cells"]}
-    if len(sources) != len(nb["cells"]):
-        pass  # duplicate cell text is allowed; per-index edits are anchored anyway
 
     cells = nb["cells"]
     edits = {
@@ -1178,6 +1334,7 @@ def build() -> str:
             cell["outputs"] = []
             cell["execution_count"] = None
 
+    assert_complete(cells)
     rendered = json.dumps(nb, indent=1, sort_keys=True) + "\n"
     # This repository is public. A concrete tailnet address or a *.ts.net name is a household
     # detail, so the build refuses to emit one. The checks are structural on purpose: the

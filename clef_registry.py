@@ -20,6 +20,7 @@ import math
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 import urllib.error
@@ -44,12 +45,18 @@ class Fault(Exception):
         super().__init__(message)
 
 
-def validate_body(body):
+def validate_body(body, peer=None):
     """Validate a lease creation body before any network or state write.
 
     The base must be a literal tailnet IPv4 address on a supported System One
     port: no names (DNS could resolve anywhere), no credentials, query or
     fragment, and no alternate API version.
+
+    ``peer`` is the caller's source address. A lease may only advertise the node it is
+    calling from, otherwise the shared bootstrap token doubles as an admission credential
+    for any tailnet endpoint -- a collector could be probed and then enabled in the pool and
+    start receiving production decision traffic. A loopback peer is exempt: it is a process
+    on this host (the offline tests, or an operator curling locally).
     """
     if not isinstance(body, dict) or set(body) != {'base', 'workers', 'bearer'}:
         raise Fault(400, 'expected base, workers and bearer')
@@ -63,6 +70,13 @@ def validate_body(body):
         ok = False
     if not ok:
         raise Fault(400, 'expected literal tailnet IPv4 and supported System One port')
+    if peer is not None:
+        try:
+            loopback = ipaddress.ip_address(peer).is_loopback
+        except (ValueError, TypeError):
+            loopback = False
+        if not loopback and u.hostname != peer:
+            raise Fault(400, 'base must be the calling node\'s own tailnet address')
     if not isinstance(body['bearer'], str) or not TOKEN.fullmatch(body['bearer']):
         raise Fault(400, 'bearer must be 32-byte hex')
     n = body['workers']
@@ -123,20 +137,27 @@ class Registry:
             raise Fault(410, 'lease ended; create a new runtime')
         return r
 
-    def create(self, run, token, body):
+    def create(self, run, token, body, peer=None):
         if not ID.fullmatch(run) or not TOKEN.fullmatch(token):
             raise Fault(400, 'invalid run id or lease token')
-        body = validate_body(body)
+        body = validate_body(body, peer)
         with self.lock:
             if run in self.records:
                 r = self.own(run, token)
                 if r['body'] != body:
                     raise Fault(409, 'run id already has different configuration')
                 return self.public(r)
+            if peer is not None:
+                # One live runtime per source address. Two kernels in one VM cannot both hold
+                # the GPUs, so a second live lease from one peer is a mistake or an abuse.
+                for other in self.records.values():
+                    if (other.get('peer') == peer
+                            and other['phase'] not in ('expired', 'withdrawn')):
+                        raise Fault(409, 'this node already holds a live lease')
             r = {'id': run, 'body': body, 'workers': body['workers'],
                  'token_hash': hashlib.sha256(token.encode()).hexdigest(),
                  'bearer': body['bearer'], 'expires': self.now() + TTL,
-                 'phase': 'staging', 'published': False}
+                 'phase': 'staging', 'published': False, 'peer': peer}
             self.records[run] = r
             self.persist()
             return self.public(r)
@@ -203,8 +224,13 @@ class Registry:
                     self.persist()
                 except Exception:
                     r['phase'] = 'staging'
-                    self.persist()
+                    # dirty first: if the state write below fails, reconciliation must still be
+                    # pending, or an enabled target survives with nothing left to retry it.
                     self.dirty = True
+                    try:
+                        self.persist()
+                    except Exception:
+                        pass
                     try:
                         self._pool()  # Verified demotion after an ambiguously applied PUT.
                     except Exception:
@@ -241,6 +267,17 @@ class Registry:
                 if r['phase'] in ('active', 'admitting'):
                     r['phase'] = 'staging'
             self.persist()
+            if not any(r['published'] for r in self.records.values()):
+                # Fail closed. An empty record set is either a first start (no alias yet) or
+                # lost state, and a lost state file must never leave stale targets routing.
+                current = self.client.pool_state()
+                if current is not None and any(
+                        target.get('enabled')
+                        for group in current.get('target_groups') or []
+                        for target in group.get('targets') or []):
+                    raise RuntimeError(
+                        'pool has enabled targets but this registrar holds no record of them; '
+                        'refusing to serve until the pool is reconciled by hand')
             self._pool()
 
     def sweep(self):
@@ -293,6 +330,9 @@ class Registry:
                 # Permit shrink only. Recovering a worker needs a fresh admission proof.
                 raise Fault(409, 'capacity increase requires a new runtime')
             if workers < r['workers']:
+                # A shrink can legitimately happen before admission, and this write creates
+                # the provider if it does not exist yet. That is not a routing decision: the
+                # pool target stays absent until `ready` publishes it.
                 try:
                     self.client.provider('clef-nb-' + run, provider_cfg(r, workers))
                 except Exception:
@@ -371,6 +411,13 @@ class Plexus:
         if isinstance(published, str) and published and '*' not in published:
             if published != cfg['api_key']:
                 raise RuntimeError('provider readback mismatch')
+
+    def pool_state(self):
+        """The pool alias as the gateway holds it, or None when it does not exist."""
+        path = '/v0/management/aliases/' + POOL
+        if self.missing(path):
+            return None
+        return self.call('GET', path)
 
     def pool(self, cfg):
         path = '/v0/management/aliases/' + POOL
@@ -469,12 +516,18 @@ class Plexus:
                         or not 0 <= value <= (1 if kind == 'noul' else 2)):
                     raise RuntimeError('invalid numeric answer')
         finally:
+            # The proof that matters is ABSENCE, not the DELETE's status. Letting a 500 or a
+            # transport error escape here skipped the absence check and could leave a live
+            # probe key on the gateway with nothing recorded about it.
             try:
                 self.call('DELETE', path)
-            except urllib.error.HTTPError as e:
-                if e.code != 404:
-                    raise
-            if not self.missing(path):
+            except Exception:
+                pass
+            try:
+                absent = self.missing(path)
+            except Exception:
+                absent = False      # cannot prove absence: treat as not deleted
+            if not absent:
                 raise RuntimeError('probe key deletion not confirmed')
 
 
@@ -485,6 +538,11 @@ class Handler(BaseHTTPRequestHandler):
     API key, or any upstream exception payload.
     """
 
+    # A peer that opens a connection and sends nothing must not pin a thread forever: enough
+    # of those would stop heartbeats being served, and the sweep would then expire every live
+    # lease and disable the whole pool. No credential is needed to try.
+    timeout = 15
+
     def log_message(self, format, *args):
         pass  # no credentials, bodies, URLs or raw exceptions in access logs
 
@@ -494,7 +552,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('content-type', 'application/json')
         self.send_header('content-length', str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass    # the peer left; that is not this service's problem
 
     def do_GET(self):
         if self.path == '/health':
@@ -513,8 +574,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_request(self):
         try:
-            auth = self.headers.get('authorization', '')
-            if not hmac.compare_digest(auth, 'Bearer ' + self.server.bootstrap):
+            # Compare bytes: hmac.compare_digest raises TypeError on a non-ASCII str, which
+            # would surface a corrupted credential as 400 "invalid request" (a terminal,
+            # non-retryable class) instead of 403.
+            auth = self.headers.get('authorization', '').encode('latin-1', 'replace')
+            expected = ('Bearer ' + self.server.bootstrap).encode('latin-1', 'replace')
+            if not hmac.compare_digest(auth, expected):
                 raise Fault(403, 'unauthorized')
             parts = self.path.split('/')
             if (len(parts) not in (4, 5) or parts[1:3] != ['v1', 'leases']
@@ -531,7 +596,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw) if raw else {}
             registry = self.server.registry
             if len(parts) == 4 and self.command == 'PUT':
-                result = registry.create(run, token, body)
+                result = registry.create(run, token, body,
+                                         peer=self.client_address[0] if self.client_address else None)
             elif len(parts) == 4 and self.command == 'GET':
                 with registry.lock:
                     result = registry.public(registry.own(run, token, terminal=True))
@@ -554,6 +620,41 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             # Deliberately generic: upstream payloads may contain credentials.
             self.reply(503, {'error': 'registration not confirmed; retry safely'})
+
+
+class RegistrarServer(ThreadingHTTPServer):
+    """Threading server with a hard thread cap and one-line error reporting."""
+
+    daemon_threads = True
+    max_workers = 32
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(self.max_workers)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            # Refuse rather than queue: a saturated pool must not delay heartbeats.
+            try:
+                request.close()
+            except Exception:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request, client_address):
+        # One line, no traceback: a peer closing mid-reply must not flood the journal.
+        print('registry request failed: ' + type(sys.exc_info()[1]).__name__, flush=True)
 
 
 def validate_bind(host):
@@ -586,8 +687,12 @@ def acquire_singleton(path):
 
 
 def start(lock_path, state_path, client, host, bootstrap, *, port=8769,
-          server_factory=ThreadingHTTPServer):
+          server_factory=RegistrarServer):
     """Lock, fail closed, then bind. Never binds a listener before recovery."""
+    # main() already checks this; the reusable entry point must too, or it would serve
+    # "Bearer " against an empty token.
+    if not isinstance(bootstrap, str) or not TOKEN.fullmatch(bootstrap):
+        raise SystemExit('registry token must be 32-byte hex')
     handle = acquire_singleton(lock_path)
     try:
         registry = Registry(state_path, client)

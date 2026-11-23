@@ -21,6 +21,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import clef_registry
 from clef_registry import (Fault, Handler, Plexus, Registry, acquire_singleton,
                            start, validate_bind)
 
@@ -47,6 +48,10 @@ class Fake:
         self.providers = {}
         self.alias = None
         self.apply = True
+        # Models a gateway that acknowledges a PUT and then persists something else (a stale
+        # cache, or another writer touching the object). The write DID apply; the readback
+        # disagrees -- which is the case the plan demands be tested separately from a no-op.
+        self.mangle = None
         self.calls = []
         self.provider_error = None
         self.pool_error = None
@@ -64,9 +69,12 @@ class Fake:
         if self.pool_error:
             raise self.pool_error
         if self.apply:
-            self.alias = deepcopy(cfg)
+            self.alias = deepcopy(self.mangle(cfg) if self.mangle is not None else cfg)
         if self.alias != cfg:
             raise RuntimeError('pool readback mismatch')
+
+    def pool_state(self):
+        return None if self.alias is None else deepcopy(self.alias)
 
     def prove(self, slug, cfg, run_id):
         self.calls.append(('prove', slug, run_id))
@@ -110,6 +118,38 @@ class Identity(Base):
         with self.assertRaises(Fault) as e:
             self.r.create(A, TOKEN, body('100.64.1.4'))
         self.assertEqual(e.exception.status, 409)
+
+    def test_lease_base_must_be_the_callers_own_address(self):
+        """A token holder may only publish the node it is actually calling from.
+
+        Without this, the shared bootstrap token is an admission credential for any tailnet
+        endpoint: a collector answering /health would be probed and then enabled in the pool,
+        receiving production decision traffic.
+        """
+        with self.assertRaises(Fault) as caught:
+            self.r.create(A, TOKEN, body('100.64.1.2'), peer='100.64.9.9')
+        self.assertEqual(caught.exception.status, 400)
+        self.assertNotIn(A, self.r.records, 'a mismatched peer must not create a record')
+
+        # the caller's own address is accepted
+        self.r.create(A, TOKEN, body('100.64.1.2'), peer='100.64.1.2')
+        self.assertEqual(self.r.records[A]['phase'], 'staging')
+
+    def test_loopback_peer_may_claim_a_tailnet_base(self):
+        """The HTTP tests and a same-host operator connect over loopback."""
+        self.r.create(A, TOKEN, body('100.64.1.2'), peer='127.0.0.1')
+        self.assertEqual(self.r.records[A]['phase'], 'staging')
+
+    def test_one_live_lease_per_peer(self):
+        self.r.create(A, TOKEN, body('100.64.1.2'), peer='100.64.1.2')
+        with self.assertRaises(Fault) as caught:
+            self.r.create(B, TOKEN, body('100.64.1.2'), peer='100.64.1.2')
+        self.assertEqual(caught.exception.status, 409)
+
+        # a terminal lease frees the slot, so a restarted kernel can re-register
+        self.r.withdraw(A, TOKEN)
+        self.r.create(B, TOKEN, body('100.64.1.2'), peer='100.64.1.2')
+        self.assertIn(B, self.r.records)
 
     def test_identity_wrong_owner(self):
         self.r.create(A, TOKEN, body())
@@ -223,6 +263,64 @@ class Lifecycle(Base):
             self.r.ready(A, TOKEN)
         self.assertNotEqual(self.r.records[A]['phase'], 'active')
         self.assertIsNone(self.client.alias)
+
+    def test_applied_pool_write_with_bad_readback_demotes_and_never_returns_ready(self):
+        """The plan's second transactional case: the PUT applied, the readback disagrees.
+
+        That is strictly worse than a no-op, because the gateway may now be routing to this
+        target. The registrar must demote, persist the demotion, keep retrying, and never
+        report READY.
+        """
+        self.r.create(A, TOKEN, body())
+        self.client.mangle = lambda cfg: dict(cfg, sticky_session=True)
+        with self.assertRaises(RuntimeError):
+            self.r.ready(A, TOKEN)
+
+        self.assertEqual(self.r.records[A]['phase'], 'staging',
+                         'a failed publication must not leave the lease active in memory')
+        self.assertEqual(self.r.public(self.r.records[A])['phase'], 'staging')
+        pool_calls = self.client.kinds('pool')
+        self.assertGreaterEqual(len(pool_calls), 2,
+                                'an ambiguous publication must be followed by a demotion write')
+        self.assertFalse(pool_calls[-1][1]['target_groups'][0]['targets'][0]['enabled'],
+                         'the demotion write must disable the target')
+        self.assertTrue(self.r.dirty, 'a failed demotion must leave reconciliation pending')
+        reloaded = Registry(self.path, self.client, now=lambda: self.clock[0])
+        self.assertEqual(reloaded.records[A]['phase'], 'staging',
+                         'the demotion must be durable, not only in memory')
+
+    def test_demotion_survives_a_persist_failure(self):
+        """A disk error while recording the demotion must not skip the demotion itself.
+
+        Ordering bug inherited from the plan's appendix: persist() ran before dirty was set
+        and before the demotion write, so a failing write left an enabled target with no sweep
+        retry and an unhandled OSError instead of the original failure.
+        """
+        self.r.create(A, TOKEN, body())
+        self.client.mangle = lambda cfg: dict(cfg, sticky_session=True)
+        real_save = clef_registry.save
+
+        state = {'failed': False}
+
+        def flaky(path, obj):
+            record = obj.get(A) or {}
+            # Fail the single write that records the demotion (staging + published). A later
+            # write succeeds so the test observes the outcome instead of the harness.
+            if (not state['failed'] and record.get('phase') == 'staging'
+                    and record.get('published')):
+                state['failed'] = True
+                raise OSError('simulated disk full')
+            return real_save(path, obj)
+
+        with mock.patch.object(clef_registry, 'save', flaky):
+            with self.assertRaises(RuntimeError):
+                self.r.ready(A, TOKEN)
+
+        self.assertTrue(self.r.dirty, 'reconciliation must stay pending')
+        pool_calls = self.client.kinds('pool')
+        self.assertGreaterEqual(len(pool_calls), 2,
+                                'the demotion write must still be attempted')
+        self.assertFalse(pool_calls[-1][1]['target_groups'][0]['targets'][0]['enabled'])
 
     def test_noop_pool_write_is_not_success(self):
         self.r.create(A, TOKEN, body())
@@ -451,6 +549,34 @@ class Validation(Base):
 
 
 class Recovery(Base):
+    def test_recovery_refuses_a_live_pool_it_has_no_record_of(self):
+        """Losing the state file must not silently leave an enabled target routed.
+
+        The plan promises pool recovery is fail-closed before the listener accepts requests.
+        With no records the old code wrote nothing at all and started serving.
+        """
+        self.client.alias = {'target_groups': [{'name': 'NOTEBOOKS', 'selector': 'random',
+                                                'targets': [{'provider': 'clef-nb-' + A,
+                                                             'model': 'clef-flash',
+                                                             'enabled': True}]}],
+                             'type': 'decisions', 'additional_aliases': [],
+                             'use_image_fallthrough': False, 'enforce_limits': False,
+                             'sticky_session': False, 'metadata': {}}
+        with self.assertRaises(RuntimeError) as caught:
+            self.r.recover()
+        self.assertIn('no record', str(caught.exception))
+
+    def test_recovery_allows_an_absent_or_fully_disabled_pool(self):
+        self.r.recover()                     # the alias does not exist yet
+        self.client.alias = {'target_groups': [{'name': 'NOTEBOOKS', 'selector': 'random',
+                                               'targets': [{'provider': 'clef-nb-' + A,
+                                                            'model': 'clef-flash',
+                                                            'enabled': False}]}],
+                             'type': 'decisions', 'additional_aliases': [],
+                             'use_image_fallthrough': False, 'enforce_limits': False,
+                             'sticky_session': False, 'metadata': {}}
+        self.r.recover()                     # tombstones only: safe to serve
+
     def test_restart_demotes_before_recovery(self):
         self.r.create(A, TOKEN, body())
         self.r.ready(A, TOKEN)
@@ -1184,11 +1310,30 @@ class AdapterProbe(AdapterCase):
         self._routes(delete=(404, None))
         self.p.prove(self.slug, self.cfg, A)
 
-    def test_probe_key_delete_failure_is_reported(self):
-        self._routes(delete=(500, None))
-        with self.assertRaises(urllib.error.HTTPError) as e:
+    def test_probe_key_delete_failure_always_checks_absence(self):
+        """A failing DELETE must not skip the absence check.
+
+        The old code let a 500 (or a transport error) escape from the finally block, so the
+        cleanup proof never ran and a live probe key could be left on the gateway.
+        """
+        # DELETE fails AND the key is still there afterwards: the honest report.
+        still_there = (200, {'allowedProviders': ['clef-nb-' + A]})
+        self._routes(delete=(500, None), absence=still_there)
+        with self.assertRaises(RuntimeError) as caught:
             self.p.prove(self.slug, self.cfg, A)
-        self.assertEqual(e.exception.code, 500)
+        self.assertIn('deletion not confirmed', str(caught.exception))
+        self.assertIn(('GET', self.key_url), [(m, u) for m, u in self.gw.paths()],
+                      'the absence of the probe key must still be verified')
+
+    def test_probe_key_delete_transport_error_also_checks_absence(self):
+        still_there = (200, {'allowedProviders': ['clef-nb-' + A]})
+        self._routes(delete=urllib.error.URLError('connection reset'),
+                     absence=still_there)
+        with self.assertRaises(RuntimeError) as caught:
+            self.p.prove(self.slug, self.cfg, A)
+        self.assertIn('deletion not confirmed', str(caught.exception))
+        self.assertEqual([(m, u) for m, u in self.gw.paths()].count(('GET', self.key_url)), 2,
+                         'one scope read and one absence read')
 
 
 class Http(Base):
@@ -1229,6 +1374,29 @@ class Http(Base):
     def lease_path(self, run=A):
         return '/v1/leases/' + run
 
+    def test_the_real_server_class_serves_over_a_bounded_worker_pool(self):
+        """The listener main() actually binds must work, and must bound itself."""
+        from clef_registry import RegistrarServer
+
+        handle, registry, server = start(
+            Path(self.tmp.name) / 'real.lock', Path(self.tmp.name) / 'real.json',
+            Fake(), '127.0.0.1', TOKEN, port=0, server_factory=RegistrarServer)
+        self.addCleanup(handle.close)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01},
+                         daemon=True).start()
+        self.addCleanup(server.shutdown)
+
+        port = server.server_address[1]
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=5) as response:
+            self.assertEqual(json.loads(response.read()), {'status': 'ok'})
+
+        # A peer that sends nothing must not hold a worker forever, and the pool is capped so
+        # a flood cannot starve heartbeats (which would expire every lease and disable the pool).
+        self.assertEqual(Handler.timeout, 15)
+        self.assertEqual(server.max_workers, 32)
+        self.assertTrue(hasattr(server, '_slots'))
+
     def test_health_is_unauthenticated(self):
         status, view, ctype = self.request('GET', '/health', auth=None, lease=None)
         self.assertEqual((status, view), (200, {'status': 'ok'}))
@@ -1257,6 +1425,31 @@ class Http(Base):
                                        {'workers': 1})
         self.assertEqual(status, 410)
         self.assertEqual(view, {'error': 'lease ended; create a new runtime'})
+
+    def test_non_ascii_credential_is_403_not_400(self):
+        """A corrupted credential is an authorisation failure, not a malformed request.
+
+        hmac.compare_digest raises TypeError on a non-ASCII str, which used to fall into the
+        400 arm and be classed by the client as a terminal malformed request.
+        """
+        import http.client
+
+        connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=10)
+        self.addCleanup(connection.close)
+        connection.putrequest('GET', self.lease_path())
+        connection.putheader('authorization', 'Bearer caf\u00e9'.encode('latin-1'))
+        connection.putheader('x-lease-token', TOKEN)
+        connection.endheaders()
+        response = connection.getresponse()
+        self.assertEqual(response.status, 403)
+        response.read()
+
+    def test_start_refuses_a_malformed_bootstrap_token(self):
+        from clef_registry import start as start_registrar
+
+        with self.assertRaises(SystemExit):
+            start_registrar(Path(self.tmp.name) / 'l.lock', Path(self.tmp.name) / 's.json',
+                            Fake(), '127.0.0.1', 'not-a-64-hex-token')
 
     def test_missing_or_wrong_bootstrap_is_403(self):
         for bootstrap in (None, 'f' * 64, ''):
@@ -1408,11 +1601,11 @@ class Service(unittest.TestCase):
         events = []
         client = Recorder(events)
         handle, registry, server = start(self.lock_path, self.state_path, client,
-                                         '100.121.214.107', TOKEN, port=8769,
+                                         '100.64.7.7', TOKEN, port=8769,
                                          server_factory=self.server_factory(events))
         self.addCleanup(handle.close)
         # Recovery demoted the lease (pool write) BEFORE the listener existed.
-        self.assertEqual(events, ['pool', ('listen', ('100.121.214.107', 8769))])
+        self.assertEqual(events, ['pool', ('listen', ('100.64.7.7', 8769))])
         self.assertEqual(registry.records[A]['phase'], 'staging')
         self.assertIs(server.registry, registry)
         self.assertEqual(server.bootstrap, TOKEN)
@@ -1423,13 +1616,13 @@ class Service(unittest.TestCase):
         self.seed_published()
         first_events = []
         handle, _, _ = start(self.lock_path, self.state_path, Recorder(first_events),
-                             '100.121.214.107', TOKEN,
+                             '100.64.7.7', TOKEN,
                              server_factory=self.server_factory(first_events))
         self.addCleanup(handle.close)
         second_events = []
         with self.assertRaises(SystemExit) as e:
             start(self.lock_path, self.state_path, Recorder(second_events),
-                  '100.121.214.107', TOKEN,
+                  '100.64.7.7', TOKEN,
                   server_factory=self.server_factory(second_events))
         self.assertEqual(str(e.exception), 'another registrar owns the pool')
         # No demotion, no pool write, no listener: the singleton is checked first.
@@ -1440,7 +1633,7 @@ class Service(unittest.TestCase):
         events = []
         client = Recorder(events, error=RuntimeError('pool readback mismatch'))
         with self.assertRaises(RuntimeError):
-            start(self.lock_path, self.state_path, client, '100.121.214.107', TOKEN,
+            start(self.lock_path, self.state_path, client, '100.64.7.7', TOKEN,
                   server_factory=self.server_factory(events))
         self.assertEqual(events, ['pool'])
         self.assertFalse([e for e in events if isinstance(e, tuple)])
@@ -1451,13 +1644,13 @@ class Service(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             start(self.lock_path, self.state_path,
                   Recorder(events, error=RuntimeError('pool readback mismatch')),
-                  '100.121.214.107', TOKEN, server_factory=self.server_factory(events))
+                  '100.64.7.7', TOKEN, server_factory=self.server_factory(events))
         events.clear()
         handle, _, _ = start(self.lock_path, self.state_path, Recorder(events),
-                             '100.121.214.107', TOKEN,
+                             '100.64.7.7', TOKEN,
                              server_factory=self.server_factory(events))
         self.addCleanup(handle.close)
-        self.assertIn(('listen', ('100.121.214.107', 8769)), events)
+        self.assertIn(('listen', ('100.64.7.7', 8769)), events)
 
     def test_acquire_singleton_reacquirable_after_close(self):
         handle = acquire_singleton(self.lock_path)
@@ -1474,7 +1667,7 @@ class Service(unittest.TestCase):
                     'fd7a:115c:a1e0::1', 'plexus.test', '', None):
             with self.assertRaises(SystemExit, msg=repr(bad)):
                 validate_bind(bad)
-        self.assertEqual(validate_bind('100.121.214.107'), '100.121.214.107')
+        self.assertEqual(validate_bind('100.64.7.7'), '100.64.7.7')
 
 
 class Terminal(Base):

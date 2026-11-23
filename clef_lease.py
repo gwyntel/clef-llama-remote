@@ -79,8 +79,9 @@ class Lease:
         return phase if phase in PHASES else UNRECOGNISED
 
     def _reason(self, method, suffix, detail):
-        return 'registrar %s %s for run %s failed: %s' % (
-            method, suffix or '/status', self.ident['run_id'], detail)
+        what = method + (' ' + suffix if suffix else '')
+        return 'registrar %s for run %s failed: %s' % (
+            what, self.ident['run_id'], detail)
 
     def call(self, method, suffix='', body=None, timeout=30):
         """One HTTP attempt. Raises LeaseFault, never a raw urllib exception."""
@@ -265,8 +266,26 @@ class Lease:
             self.lost = True
 
     def withdraw(self):
-        """Withdraw this runtime. ``withdrawn`` only becomes true on a confirmed DELETE."""
-        payload = self._write('DELETE', '', None, 'withdrawal', self._verify_withdrawn)
+        """Withdraw this runtime. ``withdrawn`` only becomes true on a confirmed DELETE.
+
+        One exception, and it is not a weakening: if create() never completed, there is no
+        lease to withdraw and the registrar's 404 is the truth, so the runtime can free its
+        resources instead of reporting INCOMPLETE forever. A 404 after a *confirmed* create
+        means the registrar lost state, which must still fail closed.
+        """
+        never_created = self.phase is None
+        try:
+            payload = self._write('DELETE', '', None, 'withdrawal', self._verify_withdrawn)
+        except LeaseFault as exc:
+            if exc.status == 404 and never_created:
+                self.withdrawn = True
+                self.phase = 'withdrawn'
+                self.last_error = None
+                self.halt.set()
+                return {'run_id': self.ident['run_id'],
+                        'provider': 'clef-nb-' + self.ident['run_id'],
+                        'phase': 'withdrawn'}
+            raise
         phase = self._phase_text(payload.get('phase'))
         if phase != 'withdrawn':
             self.last_error = 'withdrawal not confirmed; phase %s for run %s' % (

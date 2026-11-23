@@ -813,6 +813,36 @@ class Renewal(LeaseCase):
 
 
 
+class NeverCreated(LeaseCase):
+    def test_withdraw_succeeds_when_the_lease_was_never_created(self):
+        """A create that never landed leaves nothing to withdraw.
+
+        Without this, stop() retried a DELETE that could only ever 404, reported INCOMPLETE
+        and kept the GPU, the proxy and the tailnet alive for a runtime that was never routed.
+        """
+        lease = self.make_lease()
+        self.endpoint.sticky['create'] = urllib.error.URLError('boom')
+        with self.assertRaises(clef_lease.LeaseFault):
+            lease.create(BASE + '/v1', 2, BEARER)
+        self.assertIsNone(lease.phase, 'an unconfirmed create leaves no phase')
+
+        del self.endpoint.sticky['create']
+        self.endpoint.sticky['withdraw'] = http_error(404)
+        payload = lease.withdraw()
+        self.assertEqual(payload['phase'], 'withdrawn')
+        self.assertTrue(lease.withdrawn)
+        self.assertEqual(len(self.endpoint.seen('withdraw')), 1,
+                         'a 404 for a never-created lease is terminal, not retried')
+
+    def test_a_404_after_a_confirmed_create_is_still_not_success(self):
+        """State loss is not the same as never having registered: fail closed."""
+        lease = self.admitted()
+        self.endpoint.sticky['withdraw'] = http_error(404)
+        with self.assertRaises(clef_lease.LeaseFault):
+            lease.withdraw()
+        self.assertFalse(lease.withdrawn)
+
+
 class Recovery(LeaseCase):
     """The notebook needs a status read, and a lost window must be able to end.
 

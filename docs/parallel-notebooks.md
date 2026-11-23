@@ -221,3 +221,25 @@ details in a public commit.
    compares `api_key` only when the readback is unmasked. It never guesses success from a `PUT`.
 5. **`clef-flash-local` already carries a hosted fallback** (`FALLBACK → cloudflare/clef-flash`).
    That privacy/routing policy is preserved and reported, not "fixed" here.
+
+## Residual risks accepted in this version
+
+1. **The bootstrap token is the trust boundary.** A holder can admit a node from its *own*
+   tailnet address only: the registrar binds the advertised base to the caller's source address
+   and allows one live lease per source. It cannot publish another node's provider, another
+   runtime's lease, or a parent alias. Treat the token as an admission credential, not a read
+   key.
+2. **Tombstones accumulate by design.** Every run leaves a provider and a disabled pool target;
+   the state file grows with each run. Garbage collection must prove ownership, absence of alias
+   references and no active traffic, and is a separate feature.
+3. **One lock, held across Plexus calls.** A slow gateway delays other leases' heartbeats. The
+   180 s TTL absorbs normal latency; if a gateway stall outlasts it, leases expire and the pool
+   is disabled — fail-closed and recoverable when the gateway recovers, but visible as an outage.
+4. **A foreign pool target blocks further pool writes.** If anything else adds a target to
+   `clef-flash-notebooks`, the registrar refuses to rewrite the alias (`pool contains unknown
+   target`) rather than erase it. Remove that target by hand.
+5. **Lost state fails closed.** If the registrar starts with no records while the alias still
+   has enabled targets, it refuses to serve until someone reconciles the pool. That is deliberate:
+   an empty record set must never look like "nothing is published".
+6. **Secret lengths are printed at notebook start** (never values), as v9 did. If that is too
+   much, drop the `len=` from the secrets summary.
