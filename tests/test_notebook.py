@@ -5,6 +5,7 @@ These never execute a notebook cell: they inspect the generated JSON and its AST
 
 import ast
 import json
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -254,7 +255,7 @@ class RegistryUrl(unittest.TestCase):
 
     def test_rejects_shapes_that_could_capture_the_lease_token(self):
         for bad in ("", "http://100.121.214.107", "https://100.121.214.107:8769",
-                    "http://plexus.nebulosa-bass.ts.net:8769", "http://8.8.8.8:8769",
+                    "http://plexus.example.invalid:8769", "http://8.8.8.8:8769",
                     "http://192.168.86.5:8769", "http://user:pw@100.121.214.107:8769",
                     "http://100.121.214.107:8769/v1", "http://100.121.214.107:8769?x=1",
                     "http://100.121.214.107:8769#frag"):
@@ -263,3 +264,29 @@ class RegistryUrl(unittest.TestCase):
     def test_config_cell_refuses_to_start_with_a_bad_url(self):
         src = "".join(load(V10)["cells"][3]["source"])
         self.assertIn("if not _registry_url_ok(REGISTRY_URL):", src)
+
+
+class NoHouseholdDetails(unittest.TestCase):
+    """The repo is public: no private tailnet hostname or address may be embedded.
+
+    The notebook reaches exactly one private service (the registrar), and its address comes
+    from CLEF_REGISTRY_URL at run time. A baked-in default would be a household detail in a
+    published artefact.
+    """
+
+    def test_notebook_embeds_no_household_endpoint(self):
+        nb = load(V10)
+        src = "\n".join("".join(c["source"]) for c in nb["cells"])
+        # Structural, so the check itself names nothing: no *.ts.net host and no concrete
+        # address in the tailnet range. 100.64.0.0/10 is the range, not a host.
+        self.assertIsNone(re.search(r"\.ts\.net\b", src), "tailnet DNS name embedded")
+        for match in re.finditer(
+                r"\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}\b", src):
+            if src[match.end():match.end() + 1] != "/":
+                self.fail(f"concrete tailnet address embedded: {match.group(0)}")
+
+    def test_no_gateway_default_is_baked_in(self):
+        nb = load(V10)
+        src = "\n".join("".join(c["source"]) for c in nb["cells"])
+        self.assertTrue("PLEXUS_BASE = (os.environ.get" not in src,
+                        "no gateway endpoint default may be baked in")

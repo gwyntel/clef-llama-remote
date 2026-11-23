@@ -60,14 +60,23 @@ Invariants worth stating because each one is a way this can go wrong:
 2. **Management authority** — the registrar reads the existing
    `~/.hermes/secrets/plexus_admin_key` (0600). No new Plexus credential is created.
 
-3. **Bind address** — a literal tailnet IPv4, never a wildcard or LAN address:
+3. **Endpoints file** — the unit takes both endpoints from a gitignored `0600` file, because
+   this repository is public and the tailnet addresses are household details:
 
    ```bash
-   tailscale ip -4          # must equal CLEF_REGISTRY_HOST in the unit
+   U=$(tailscale ip -4)          # this host's literal tailnet IPv4
+   umask 077
+   cat > ~/.hermes/secrets/clef-notebook-registry.env <<EOF
+   CLEF_REGISTRY_HOST=$U
+   PLEXUS_BASE_URL=https://<plexus-base>
+   EOF
+   chmod 600 ~/.hermes/secrets/clef-notebook-registry.env
+   echo "bind=$U"            # prints the address, never a secret
    ```
 
-   If it changed, update `deploy/clef-notebook-registry.service` **and** the URL supplied to
-   notebooks. Changing ACL/grants is out of scope and needs its own authorisation.
+   The bind address must be a literal tailnet IPv4, never a wildcard or LAN address, and it must
+   match the URL supplied to notebooks (`CLEF_REGISTRY_URL`). If it changes, update this file and
+   the Colab-side value. Changing ACL/grants is out of scope and needs its own authorisation.
 
 4. **Singleton check** — the registrar takes `fcntl.flock` on
    `~/.hermes/state/clef-notebook-registry.lock` **before** `recover()`, so a second process
@@ -78,9 +87,10 @@ Invariants worth stating because each one is a way this can go wrong:
 ```bash
 install -m 644 deploy/clef-notebook-registry.service ~/.config/systemd/user/
 systemctl --user daemon-reload
+systemd-analyze verify ~/.config/systemd/user/clef-notebook-registry.service
 systemctl --user start clef-notebook-registry.service
-ss -ltnp | grep 8769                      # expect exactly 100.121.214.107:8769
-curl -s http://100.121.214.107:8769/health   # expect {"status":"ok"}
+ss -ltnp | grep 8769                      # expect exactly <CT tailnet IPv4>:8769
+curl -s http://<CT tailnet IPv4>:8769/health   # expect {"status":"ok"}
 journalctl --user -u clef-notebook-registry -n 40 --no-pager
 ```
 
@@ -96,7 +106,7 @@ There is no Plexus, gateway or container restart in this procedure.
 |---|---|---|
 | `TAILSCALE_API_KEY` | Colab secret panel | existing device/key-scoped token |
 | `CLEF_REGISTRY_KEY` | Colab secret panel | the 32-byte hex registry token |
-| `CLEF_REGISTRY_URL` | environment, `.env`, or Colab secret | `http://100.121.214.107:8769` |
+| `CLEF_REGISTRY_URL` | environment, `.env`, or Colab secret | `http://<CT tailnet IPv4>:8769` |
 
 The userspace HTTP CONNECT proxy that v9 armed (`127.0.0.1:1055`) is preserved and is the only
 route off the VM. There is no Funnel or public exposure at any point.

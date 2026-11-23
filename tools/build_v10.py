@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -75,6 +76,29 @@ def replace_method(source: str, class_name: str, method_name: str, replacement: 
 def delete_method(source: str, class_name: str, method_name: str) -> str:
     start, end = _span(_method(_class(ast.parse(source), class_name), method_name))
     return _replace_span(source, start, end, "")
+
+
+def drop_assignment(source: str, name: str) -> str:
+    """Delete the single module-level `name = ...` line (continuations included)."""
+    lines = source.splitlines(keepends=True)
+    hits = [i for i, line in enumerate(lines) if line.startswith(name + " =")]
+    if len(hits) != 1:
+        raise RuntimeError(f"expected exactly one {name} assignment, found {len(hits)}")
+    i = hits[0]
+    # drop continuation lines of a bracketed assignment (balanced lines are single-line)
+    def delta(text):
+        return (text.count("(") + text.count("[") + text.count("{")
+                - text.count(")") - text.count("]") - text.count("}"))
+
+    depth = delta(lines[i])
+    end = i + 1
+    while depth > 0 and end < len(lines):
+        depth += delta(lines[end])
+        end += 1
+    del lines[i:end]
+    out = "".join(lines)
+    ast.parse(out)
+    return out
 
 
 def replace_class(source: str, class_name: str, replacement: str) -> str:
@@ -247,6 +271,9 @@ From a tailnet peer. `100.x.y.z` is this node's tailnet IPv4 and `clef-nb-<uuid>
 slug, both printed by the status block in the bring-up cell.
 
 ```bash
+PLEXUS_BASE=https://<your-plexus-base>    # your gateway base URL; export it, never commit it
+export PLEXUS_BASE
+
 # 1. node liveness (unauthenticated by design: run id, per-worker health, in-flight count)
 curl -s http://100.x.y.z:8080/health | jq
 
@@ -260,15 +287,15 @@ curl -s http://100.x.y.z:8769/v1/leases/<uuid> \\
 
 # 4. what the registrar stored for THIS run's provider
 curl -s -H "x-admin-key: $PLEXUS_ADMIN_KEY" \\
-  https://plexus.nebulosa-bass.ts.net/v0/management/providers/clef-nb-<uuid> | jq '.api_base_url, .maxConcurrency'
+  $PLEXUS_BASE/v0/management/providers/clef-nb-<uuid> | jq '.api_base_url, .maxConcurrency'
 
 # 5. the dedicated pool: this run's target, enabled exactly once
 curl -s -H "x-admin-key: $PLEXUS_ADMIN_KEY" \\
-  https://plexus.nebulosa-bass.ts.net/v0/management/aliases/clef-flash-notebooks \\
+  $PLEXUS_BASE/v0/management/aliases/clef-flash-notebooks \\
   | jq '.target_groups[] | {name, selector, targets}'
 
 # 6. end-to-end through Plexus, scoped to this one provider
-curl -s https://plexus.nebulosa-bass.ts.net/v1/systemone \\
+curl -s $PLEXUS_BASE/v1/systemone \\
   -H "Authorization: Bearer <a key scoped to clef-nb-<uuid>>" -H 'content-type: application/json' \\
   -d '{"model":"direct/clef-nb-<uuid>/clef-flash","state":"ping","questions":{"n":{"type":"noul","instructions":"hi"}}}' | jq
 ```
@@ -289,8 +316,11 @@ afterwards.
 A notebook holds no inference key at all, so operator direct calls need a key you scope yourself:
 
 ```bash
+PLEXUS_BASE=https://<your-plexus-base>    # your gateway base URL; export it, never commit it
+export PLEXUS_BASE
+
 # this runtime's provider, bypassing the pool alias
-curl -s https://plexus.nebulosa-bass.ts.net/v1/systemone \\
+curl -s $PLEXUS_BASE/v1/systemone \\
   -H "Authorization: Bearer <key scoped to clef-nb-<uuid>>" -H 'content-type: application/json' \\
   -d '{"model":"direct/clef-nb-<uuid>/clef-flash","state":"ping","questions":{"n":{"type":"noul","instructions":"hi"}}}' | jq
 ```
@@ -302,11 +332,11 @@ body with `jq` and keep the secret in a shell variable so neither ever appears i
 THROWAWAY="sk-$(openssl rand -hex 24)"     # local only; never paste it into a notebook
 jq -n --arg s "$THROWAWAY" --arg p "clef-nb-<uuid>" \\
   '{secret:$s, comment:"temporary, delete after use", allowedProviders:[$p]}' > /tmp/probe-key.json
-curl -s -X PUT "https://plexus.nebulosa-bass.ts.net/v0/management/keys/zz-verify-<uuid>" \\
+curl -s -X PUT "$PLEXUS_BASE/v0/management/keys/zz-verify-<uuid>" \\
   -H "x-admin-key: $PLEXUS_ADMIN_KEY" -H 'content-type: application/json' \\
   --data @/tmp/probe-key.json
 # ... use it ...
-curl -s -X DELETE "https://plexus.nebulosa-bass.ts.net/v0/management/keys/zz-verify-<uuid>" \\
+curl -s -X DELETE "$PLEXUS_BASE/v0/management/keys/zz-verify-<uuid>" \\
   -H "x-admin-key: $PLEXUS_ADMIN_KEY"
 shred -u /tmp/probe-key.json 2>/dev/null || rm -f /tmp/probe-key.json
 ```
@@ -518,25 +548,33 @@ TS_STATE = STATE_DIR / "tailscaled.state"''',
     )
     src = sub(
         src,
-        '''ALIAS = "cloudflare/clef-flash"
-PROVIDER = "clef-llama-remote"
-MODEL = "clef-flash"
-SELF_TEST_MODEL = f"direct/{PROVIDER}/{MODEL}"
-TS_API_BASE = "https://api.tailscale.com/api/v2"
-TS_TAG = "tag:endpoints"
-TS_AUTHKEY_EXPIRY_SECONDS = 3600
-TS_HOSTNAME = "clef-llama-remote"
-EXPECTED_DNSNAME = "clef-llama-remote.nebulosa-bass.ts.net"''',
-        '''ALIAS = "cloudflare/clef-flash"   # parent alias: documented here, never written by a notebook
-PROVIDER = IDENT["hostname"]      # unique per runtime, e.g. clef-nb-<32 hex>
-MODEL = "clef-flash"
-SELF_TEST_MODEL = f"direct/{PROVIDER}/{MODEL}"
-TS_API_BASE = "https://api.tailscale.com/api/v2"
-TS_TAG = "tag:endpoints"
-TS_AUTHKEY_EXPIRY_SECONDS = 3600
-TS_HOSTNAME = IDENT["hostname"]   # unique per runtime, so two notebooks never share a node name''',
+        'ALIAS = "cloudflare/clef-flash"',
+        'ALIAS = "cloudflare/clef-flash"   # parent alias: documented here, never written by a notebook',
     )
+    src = sub(
+        src,
+        'PROVIDER = "clef-llama-remote"',
+        'PROVIDER = IDENT["hostname"]      # unique per runtime, e.g. clef-nb-<32 hex>',
+    )
+    src = sub(
+        src,
+        'TS_HOSTNAME = "clef-llama-remote"',
+        'TS_HOSTNAME = IDENT["hostname"]   # unique per runtime, so no two notebooks share a node',
+    )
+    # EXPECTED_DNSNAME asserted a shared hostname; v10 has no expected name at all, so the
+    # whole assignment goes. Matched by prefix: the build source must not spell out a tailnet
+    # name of its own.
+    src = drop_assignment(src, "EXPECTED_DNSNAME")
     src = sub(src, CELL3_KEYPROVIDER_OLD, CELL3_KEYPROVIDER_NEW)
+    # No gateway endpoint is baked in: this notebook talks to the registrar only, and the
+    # registrar's address arrives through CLEF_REGISTRY_URL (validated above).
+    # Matched by prefix: the anchor would otherwise have to spell out the v9 default endpoint.
+    src = drop_assignment(src, "PLEXUS_BASE")
+    src = sub(
+        src,
+        'log(f"root={ROOT}  ts_dir={TS_DIR}  plexus={PLEXUS_BASE}")',
+        'log(f"root={ROOT}  ts_dir={TS_DIR}  registrar={REGISTRY_URL}")',
+    )
     return src
 
 
@@ -1140,7 +1178,22 @@ def build() -> str:
             cell["outputs"] = []
             cell["execution_count"] = None
 
-    return json.dumps(nb, indent=1, sort_keys=True) + "\n"
+    rendered = json.dumps(nb, indent=1, sort_keys=True) + "\n"
+    # This repository is public. A concrete tailnet address or a *.ts.net name is a household
+    # detail, so the build refuses to emit one. The checks are structural on purpose: the
+    # patterns themselves reveal nothing about this network.
+    found = re.search(r"\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}\b",
+                      rendered)
+    # `100.64.0.0/10` is the tailnet RANGE, which the notebook's validator legitimately names.
+    # Only a concrete host address is a household detail.
+    while found and rendered[found.end():found.end() + 1] == "/":
+        found = re.compile(r"\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}\b") \
+            .search(rendered, found.end())
+    if found:
+        raise RuntimeError("concrete tailnet address survived the build: " + found.group(0))
+    if re.search(r"\.ts\.net\b", rendered):
+        raise RuntimeError("tailnet DNS name survived the build")
+    return rendered
 
 
 def main(argv: list[str]) -> int:

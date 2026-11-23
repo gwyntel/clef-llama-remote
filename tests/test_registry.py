@@ -395,7 +395,7 @@ class Validation(Base):
             'http://192.168.1.5:8443/v1',        # RFC1918, not tailnet
             'http://10.0.0.4:8443/v1',           # RFC1918, not tailnet
             'http://100.128.0.1:8443/v1',        # inside 100/8 but outside 100.64/10
-            'http://plexus.nebulosa-bass.ts.net:8443/v1',  # name, not literal IP
+            'http://plexus.example.invalid:8443/v1',  # a name, not a literal IP
             'https://100.64.1.2:8443/v1',        # wrong scheme
             'ftp://100.64.1.2:8443/v1',          # wrong scheme
             'http://100.64.1.2:80/v1',           # unsupported port

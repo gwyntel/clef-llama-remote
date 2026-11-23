@@ -8,9 +8,13 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/hermes/projects/clef-llama-remote
 Environment=PYTHONUNBUFFERED=1
-# Bind the literal tailnet IPv4 (re-check with `tailscale ip -4` before enabling).
-Environment=CLEF_REGISTRY_HOST=100.121.214.107
-Environment=PLEXUS_BASE_URL=https://plexus.nebulosa-bass.ts.net
+# Endpoints are NOT committed: this repository is public. The unit reads a gitignored 0600
+# env file containing exactly:
+#   CLEF_REGISTRY_HOST=<literal tailnet IPv4 of this host>
+#   PLEXUS_BASE_URL=<plexus base URL>
+# The leading '-' keeps the file optional, so a missing file surfaces as a clear startup
+# error ('registry must bind a literal tailnet IPv4') rather than a unit-load failure.
+EnvironmentFile=-/home/hermes/.hermes/secrets/clef-notebook-registry.env
 ExecStart=/usr/bin/python3 /home/hermes/projects/clef-llama-remote/clef_registry.py
 Restart=on-failure
 RestartSec=10
