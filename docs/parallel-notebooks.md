@@ -158,6 +158,26 @@ alias pointing at `clef-flash-notebooks`, a temporary key scoped to it,
 `POST /v1/systemone`, then delete the alias and key and verify absence. Do not force the route by
 disabling legacy or paid fallbacks.
 
+## Acceptance status (2026-11-23)
+
+Performed with a single live runtime:
+
+- **Admission** — lease active and renewing; provider `clef-nb-<uuid>` with the correct base,
+  `maxConcurrency` equal to the healthy worker count, `timeoutMs`, decisions model; the temporary
+  probe key created, used and deleted with absence verified.
+- **Standalone pool** — the pool alias exists with exactly one enabled target.
+- **Nested routing on the deployed gateway** — temp one-target alias -> pool -> provider served a
+  real `/v1/systemone` request (9/9 checks, temp objects deleted and verified absent).
+- **Parent linking** — one pointer per parent, snapshot-diff verified, integrated route served by
+  the notebook through `clef-flash-local`.
+- **Dual-T4 two-worker acceptance** — **explicitly waived by the operator on 2026-11-23. NOT
+  PERFORMED.** The two-worker path is therefore unproven on real hardware; everything it depends
+  on (worker plan, per-worker cap, GPU-residency proof) is covered only by the single-worker run
+  and the offline tests. Do not read this as passing.
+- **Graceful stop / hard-death expiry / registrar restart** curves from the step list above were
+  not exercised against a live runtime in this session; they remain the first things to verify
+  the next time a runtime is started for testing.
+
 ## Two-notebook acceptance (real GPUs, approval required)
 
 Leave every older notebook alone. Start A and B as **separate new GPU runtimes**. After every
