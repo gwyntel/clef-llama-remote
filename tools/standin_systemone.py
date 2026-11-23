@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 KEY = os.environ.get("CLEF_REMOTE_KEY", "")
 PORT = int(os.environ.get("STANDIN_PORT", "8080"))
+# Default stays loopback; override to reach it from Plexus over the tailnet.
+HOST = os.environ.get("STANDIN_HOST", "127.0.0.1")
 
 
 class H(BaseHTTPRequestHandler):
@@ -68,7 +70,7 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not KEY:
         sys.exit("CLEF_REMOTE_KEY must be set")
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
+    srv = ThreadingHTTPServer((HOST, PORT), H)
     srv.daemon_threads = True
-    print(f"standin listening 127.0.0.1:{PORT}", flush=True)
+    print(f"standin listening {HOST}:{PORT}", flush=True)
     srv.serve_forever()

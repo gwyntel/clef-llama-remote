@@ -442,7 +442,7 @@ class Plexus:
             if got.get(key) != cfg[key]:
                 raise RuntimeError('pool readback mismatch')
 
-    def prove(self, slug, cfg, run, attempts=3, timeout=120):
+    def prove(self, slug, cfg, run, attempts=8, timeout=120):
         """Prove this instance end-to-end THROUGH Plexus, then remove the key.
 
         The probe uses a temporary inference key scoped to this one provider and
@@ -490,18 +490,28 @@ class Plexus:
                                                   'A food is named but no classification is supplied.',
                                                   'A food and an explicit classification are supplied.']}}}
             answer = None
+            # Two budgets: cheap status answers (401 propagation, 404/500/503) may take the
+            # full attempt count, but a hung request costs the whole 120 s timeout, so
+            # transport failures stay capped at three (3 x 120 s + sleeps < the client's 650 s
+            # ready timeout).
+            transport_failures = 0
             for attempt in range(attempts):
                 try:
                     answer = self.call('POST', '/v1/systemone', payload,
                                        bearer=secret, timeout=timeout)
                     break
                 except urllib.error.HTTPError as e:
-                    # Only propagation-shaped failures are retryable; 401/403/409
-                    # and malformed requests fail immediately.
-                    if e.code not in (404, 500, 503) or attempt == attempts - 1:
+                    # 401 on a key we JUST minted and read back is propagation, not auth: the
+                    # deployed gateway answers 401 for a few seconds after a key is created
+                    # (measured: mint -> 401, same key -> 200 after ~8 s). Treating it as
+                    # fatal would reject every admission. 403/409 and malformed requests are
+                    # still immediate, and the budget below is bounded, so a genuinely wrong
+                    # key fails closed rather than looping.
+                    if e.code not in (401, 404, 500, 503) or attempt == attempts - 1:
                         raise
                 except (TimeoutError, ConnectionError, urllib.error.URLError):
-                    if attempt == attempts - 1:
+                    transport_failures += 1
+                    if transport_failures >= 3:
                         raise
                 self.sleep(3)
             answers = answer.get('answers', {})
@@ -730,6 +740,10 @@ def main():
         home / 'state' / 'clef-notebook-registry.json',
         client, host, bootstrap)
     threading.Thread(target=sweep_forever, args=(registry,), daemon=True).start()
+    # Evidence in the journal that recovery finished BEFORE the listener existed, and that no
+    # demotion failed. A failed recovery raises above this line and never reaches it.
+    print('registry: recovery complete (%d lease record(s)); listening on %s:%d'
+          % (len(registry.records), host, 8769), flush=True)
     try:
         server.serve_forever()
     finally:

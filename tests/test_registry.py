@@ -1260,13 +1260,28 @@ class AdapterProbe(AdapterCase):
                                  ['DELETE', 'GET'])
                 self.assertEqual(self.gw.paths()[-1], ('GET', self.key_url))
 
-    def test_upstream_401_is_not_retried(self):
+    def test_fresh_key_401_is_treated_as_propagation_and_then_succeeds(self):
+        """A just-minted key is invisible to the inference path for a few seconds.
+
+        Measured live on the deployed gateway: mint -> immediate /v1/systemone returns 401,
+        and the same key returns 200 a few seconds later. Treating that 401 as a permanent
+        auth failure would reject every admission.
+        """
+        self._routes(systemone=[(401, {'error': 'unauthorized'}),
+                                (401, {'error': 'unauthorized'}),
+                                (200, probe_answers())])
+        self.assertIsNone(self.p.prove(self.slug, self.cfg, A))
+        self.assertEqual(len(self.gw.calls('POST')), 3)
+        self.assertEqual(self.sleeps, [3, 3])
+
+    def test_a_permanently_401_key_fails_closed_with_a_bounded_budget(self):
         self._routes(systemone=(401, {'error': 'unauthorized'}))
         with self.assertRaises(urllib.error.HTTPError) as e:
             self.p.prove(self.slug, self.cfg, A)
         self.assertEqual(e.exception.code, 401)
-        self.assertEqual(len(self.gw.calls('POST')), 1)
-        self.assertEqual(self.sleeps, [])
+        self.assertEqual(len(self.gw.calls('POST')), 8, 'bounded, not unbounded, retries')
+        self.assertEqual(self.gw.calls('DELETE')[0]['url'], self.key_url,
+                         'the probe key is still cleaned up')
         self.assertEqual(self.gw.calls('DELETE')[0]['url'], self.key_url)
 
     def test_transient_503_is_retried_with_bounded_timeout(self):

@@ -243,3 +243,73 @@ details in a public commit.
    an empty record set must never look like "nothing is published".
 6. **Secret lengths are printed at notebook start** (never values), as v9 did. If that is too
    much, drop the `len=` from the secrets summary.
+
+## Activation record (2026-11-23)
+
+Provisioned and verified on CT 102 (`100.121.214.107`, the registrar host):
+
+| Check | Result |
+|---|---|
+| `~/.hermes/secrets/clef_registry_key` | generated, 64 hex, mode 0600, never printed |
+| `~/.hermes/secrets/clef-notebook-registry.env` | `CLEF_REGISTRY_HOST` + `PLEXUS_BASE_URL`, mode 0600 |
+| Unit installed + enabled | `clef-notebook-registry.service` (survives reboot) |
+| Listener | `ss -ltnp` -> `100.121.214.107:8769` only, no wildcard, no LAN |
+| Health | `GET /health` -> `{"status": "ok"}` |
+| State | `~/.hermes/state/clef-notebook-registry.json` `{}`, mode 0600; lock 0600 |
+| Journal | `registry: recovery complete (0 lease record(s)); listening on 100.121.214.107:8769` — recovery before the listener, no demotion failure |
+
+The startup line exists so this acceptance is checkable from the journal rather than inferred.
+
+## Paused automation (paused 2026-11-23 for v10 testing)
+
+Paused deliberately so notebook registration can be observed without alias writers competing.
+**Resume every item below, in this order, when testing ends.**
+
+| What | Was | Now | Resume with |
+|---|---|---|---|
+| Cron `9d07766b6529` "Clef judge dispatch (T4 + Mac)" | active, every 15 min | **paused** | `hermes cron resume 9d07766b6529` |
+| `clef-local-reconciler.timer` | active | **stopped** | `systemctl --user start clef-local-reconciler.timer` |
+| `clef-rung-guard.timer` | active | **stopped** | `systemctl --user start clef-rung-guard.timer` |
+| `clef-judge.service` | active + enabled | **stopped + disabled** | `systemctl --user enable --now clef-judge.service` |
+
+Note: the two timers are stopped but still *enabled*, so a reboot would restart them. If the pause
+must survive a reboot, also `systemctl --user disable` them (and re-enable on resume).
+
+## Routing proof on the deployed gateway (2026-11-23, 15/15 checks)
+
+Run against the live Plexus with a self-contained chain that mirrors the real shape — outer alias
+-> single alias pointer -> one-target alias -> provider -> stand-in `/v1/systemone` — plus a
+scoped inference key. Nothing shared was touched: every object was created with a `zz-probe-`
+prefix, deleted, and its absence re-verified (alias, provider and key all 404 afterwards).
+
+Confirmed: pointer written as `alias` reads back as an alias reference; a two-level alias chain
+serves decisions (`served=standin-t4`); `direct/<provider>/<model>` works (the path the
+registrar's admission probe uses); and a scoped key refuses a provider outside its allow-list
+with **403**.
+
+**Two live findings this proof produced, both fixed in code:**
+
+1. **`/v1/systemone` requires `allowRawPassthrough` on the inference key.** Without it the route
+   is not permitted. The registrar's probe key now sets it.
+2. **A freshly minted key answers 401 for several seconds** (measured: mint -> 401, same key ->
+   200 after ~8 s) because the gateway caches the key list. Treating that 401 as an auth failure
+   would have rejected **every** admission. The probe now treats 401 on a just-minted key as
+   propagation, with a bounded budget (8 cheap attempts, 3 s apart) while transport failures stay
+   capped at 3 so a hung request cannot exceed the client's 650 s ready timeout.
+
+## Parent linking — not yet done, and why
+
+`clef-flash-notebooks` does not exist until the first notebook is admitted (the registrar only
+writes the pool once it has a published lease; it will not create an empty alias, because that
+shape is invalid). At activation time the alias returned 404 and there were no `clef-nb-*`
+providers.
+
+Inserting the pool pointer *before* the alias exists would point a production alias at a
+non-existent target, which is precisely the unproven routing change this feature must not make.
+So the linking is deferred until a v10 runtime has been admitted, at which point:
+
+1. snapshot both parents (still required — the timers are paused but that is not proof);
+2. re-assert the alias exists and has exactly one enabled target;
+3. run the insertion algorithm above on each parent, and assert that removing exactly the
+   inserted pointer restores the pre-write snapshot byte-for-byte;
+4. re-GET both parents after resuming the writers.
