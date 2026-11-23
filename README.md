@@ -28,12 +28,51 @@ Colab VM (ephemeral)                                    constellation
 | Path | Purpose |
 |---|---|
 | `notebooks/clef-llama-colab-v5.ipynb` | the runtime: 19 cells, 13 code cells, 3 labelled shell cells |
+| `notebooks/clef-llama-colab-v10.ipynb` | **parallel-safe runtime** (generated): one unique provider/hostname/lease per run, no shared writes |
+| `notebooks/source/clef-runtime-v9.ipynb` | sanitized, output-free source imported from the Drive v9 notebook that v10 is derived from |
+| `clef_lease.py` | per-run lease client (embedded verbatim into v10) |
+| `clef_registry.py` | tailnet-only registrar: single writer of `clef-flash-notebooks`, readiness-gated admission |
+| `tools/build_v10.py` | deterministic AST transform v9 → v10; `--check` proves reproducibility |
+| `deploy/clef-notebook-registry.service` | staged systemd user unit for the registrar (not auto-installed) |
+| `docs/parallel-notebooks.md` | registrar setup, activation, withdrawal and two-notebook acceptance checklist |
 | `plexus_setup.py` | one-time: creates the provider + the **disabled** rung, pins the alias context |
 | `README.md` | this file |
 | `EVIDENCE.md` | verified-facts log: management calls, rung context sources, and the end-to-end routing proof |
 | `tools/rung.py` | `status` / `on --base …` / `off` / `base --base …` — flip the rung by hand, each write re-`GET`-ed |
 | `tools/standin_systemone.py` | stand-in `/v1/systemone` upstream (marked answers, no model) used to prove routing end to end |
 | `clef_remote_key.txt` | local-only bearer for the provider; gitignored, never committed |
+
+## Parallel notebooks (v10)
+
+`notebooks/clef-llama-colab-v10.ipynb` is the parallel-safe runtime and is **additive**: v5 and
+`tools/rung.py` keep working exactly as documented below.
+
+The v5 lifecycle above assumes one notebook owns the shared objects — provider `clef-llama-remote`,
+the `LOCAL` rung of `cloudflare/clef-flash`, and the hostname `clef-llama-remote`. That assumption
+is what breaks with two runtimes: each start overwrites the other's provider base, and each start
+deletes same-named Tailscale nodes it cannot prove are its own.
+
+v10 gives every run its own UUID-derived provider slug, Tailscale hostname, private daemon
+state/socket, and bearer, and moves the only unavoidable serialization point into a small
+tailnet-only **registrar** (`clef_registry.py`) that is the sole writer of a dedicated
+`clef-flash-notebooks` pool alias:
+
+- the notebook holds only `TAILSCALE_API_KEY` and `CLEF_REGISTRY_KEY` — never a Plexus admin key
+  and never a shared inference key;
+- the registrar creates the provider, proves it *through Plexus* with a temporary
+  provider-scoped key, and only then enables that one target (readiness-gated admission);
+- leases renew every 20 s with a 180 s TTL, so a hard-killed VM stops being selected without
+  anyone editing the pool;
+- teardown withdraws the lease, waits for the routing reload and a local drain, and deletes only
+  its own Tailscale device;
+- nothing in a notebook's start/stop path writes a parent alias. Inserting the pool pointer into
+  `cloudflare/clef-flash` / `clef-flash-local` is a one-time operator action.
+
+Same-VM multi-kernel GPU sharing is refused (a VM-wide lock); separate Colab/Kaggle runtimes are
+independent and supported. The model, GGUF, llama.cpp release, CUDA runtime, `-b 16384 -ub 16384`,
+`CTX_T4=32768`, GPU-residency proof and userspace outbound proxy are unchanged from v9.
+
+Setup, activation and the two-notebook acceptance procedure: `docs/parallel-notebooks.md`.
 
 ## What the run does, in order
 

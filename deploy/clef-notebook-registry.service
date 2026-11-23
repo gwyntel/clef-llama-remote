@@ -1,0 +1,34 @@
+[Unit]
+Description=Clef notebook lease registrar (dedicated Plexus pool)
+Documentation=file:///home/hermes/projects/clef-llama-remote/docs/parallel-notebooks.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes/projects/clef-llama-remote
+Environment=PYTHONUNBUFFERED=1
+# Endpoints are NOT committed: this repository is public. The unit reads a gitignored 0600
+# env file containing exactly:
+#   CLEF_REGISTRY_HOST=<literal tailnet IPv4 of this host>
+#   PLEXUS_BASE_URL=<plexus base URL>
+# The leading '-' keeps the file optional, so a missing file surfaces as a clear startup
+# error ('registry must bind a literal tailnet IPv4') rather than a unit-load failure.
+EnvironmentFile=-/home/hermes/.hermes/secrets/clef-notebook-registry.env
+ExecStart=/usr/bin/python3 /home/hermes/projects/clef-llama-remote/clef_registry.py
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+# Defence in depth for a process that holds the Plexus admin key. Deliberately conservative:
+# the registrar only needs TCP/IP, a unix socket for nothing, its state directory and DNS.
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+TasksMax=64
+# Optional, once a first start has been verified: ProtectSystem=strict with
+# ReadWritePaths=/home/hermes/.hermes/state, and ProtectHome=read-only. Left off here so a
+# first activation cannot fail on a path this unit did not anticipate.
+
+[Install]
+WantedBy=default.target
