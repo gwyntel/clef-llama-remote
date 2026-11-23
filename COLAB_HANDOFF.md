@@ -1,5 +1,12 @@
 # Colab handoff — Clef-Flash through Plexus
 
+> **Two notebooks exist.** This page documents **v5**, which owns the shared provider
+> `clef-llama-remote` and the `LOCAL` rung of `cloudflare/clef-flash` — use it only when exactly
+> one runtime will be up. **v10** (`notebooks/clef-llama-colab-v10.ipynb`) is the parallel-safe
+> runtime: unique provider/hostname/lease per run, readiness-gated admission through the registrar,
+> and no shared writes. Its setup, activation and acceptance procedure are in
+> `docs/parallel-notebooks.md`; v5 instructions below are unchanged.
+
 ## Open and configure
 
 1. Open `notebooks/clef-llama-colab-v5.ipynb` in Colab.
